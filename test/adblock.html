@@ -80,12 +80,35 @@
     press(40);
     var start = focused();
     check('down focuses something', !!start);
+    // Up to the top row of links, away from the video, where left and right mean seek.
+    press(38);
+    var top = focused();
+    check('up moves focus up', !!top && top.top < start.top);
     press(37);
     var moved = focused();
-    check('left moves focus to the left', !!moved && moved.left < start.left);
+    // Navigation goes by the center of each item, so compare centers.
+    function middle(box) { return box.left + box.width / 2; }
+    check('left moves focus to the left', !!moved && middle(moved) < middle(top));
     press(39);
     var back = focused();
-    check('right moves focus back to the right', !!back && back.left > moved.left);
+    check('right moves focus back to the right', !!back && middle(back) > middle(moved));
+
+    var seeks = 0;
+    var video = document.getElementById('video');
+    Object.defineProperty(video, 'currentTime', { get: function () { return 0; }, set: function () { seeks++; } });
+    while (document.querySelector('.omes-focus') !== video && seeks === 0 && out.length < 60) {
+      press(40);
+      out.push('moved down');
+      if (document.querySelector('.omes-focus').getBoundingClientRect().top > 500) break;
+    }
+    out = out.filter(function (line) { return line !== 'moved down'; });
+    if (document.querySelector('.omes-focus') === video) {
+      var videoBox = focused();
+      press(39);
+      check('left and right seek a focused video', seeks === 1 && focused().left === videoBox.left);
+    } else {
+      check('down reaches the video', false);
+    }
     check('only one item is focused', document.querySelectorAll('.omes-focus').length === 1);
 
     document.getElementById('popup').click();
