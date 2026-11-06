@@ -19,6 +19,19 @@ const SETUP_PORT = 18095;
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'omes-a-show-'));
 const CONFIG = path.join(dir, 'config.json');
 const ICON_DIR = path.join(dir, 'icons');
+const PROC = path.join(dir, 'proc');
+function writeProc(busyTicks, idleTicks, procTicks) {
+  fs.mkdirSync(path.join(PROC, '4321'), { recursive: true });
+  fs.mkdirSync(path.join(PROC, '999'), { recursive: true });
+  fs.writeFileSync(path.join(PROC, 'stat'), 'cpu  ' + busyTicks + ' 0 0 ' + idleTicks + ' 0 0 0 0 0 0\ncpu0 1 0 0 1\n');
+  fs.writeFileSync(path.join(PROC, 'meminfo'), 'MemTotal: 2048000 kB\nMemFree: 100000 kB\nMemAvailable: 512000 kB\n');
+  fs.writeFileSync(path.join(PROC, 'loadavg'), '3.50 2.00 1.00 2/300 4321\n');
+  const stat = (name, ticks, rss) => '1 (' + name + ') S 1 1 1 0 -1 0 0 0 0 0 ' + ticks + ' 0 0 0 20 0 1 0 0 0 ' + rss + ' 0';
+  fs.writeFileSync(path.join(PROC, '4321', 'stat'), stat('Web Process', procTicks, 51200));
+  fs.writeFileSync(path.join(PROC, '4321', 'cmdline'), 'wrt-loader\0--site\0');
+  fs.writeFileSync(path.join(PROC, '999', 'stat'), stat('idle thing', 0, 1024));
+  fs.writeFileSync(path.join(PROC, '999', 'cmdline'), 'idle');
+}
 const ICON = path.join(dir, 'icon.png');
 fs.writeFileSync(ICON, 'png-bytes');
 
@@ -147,7 +160,9 @@ function loadService(port, tvPort) {
       OMES_A_SHOW_SETUP_PORT: String(SETUP_PORT),
       TV_PORT: String(tvPort),
       OMES_A_SHOW_CONFIG: CONFIG,
-      OMES_A_SHOW_ICONS: ICON_DIR
+      OMES_A_SHOW_ICONS: ICON_DIR,
+      OMES_A_SHOW_PROC: PROC,
+      OMES_A_SHOW_SPEED_URL: 'https://127.0.0.1:' + feedPort + '/speed'
     }
   };
   sandbox.setInterval = (fn) => { clock.tickers.add(fn); return fn; };
@@ -412,6 +427,51 @@ test('icon uploads need the PIN and a real PNG', async () => {
   await get(PORT, '/setup/stop');
 });
 
+test('the speed test records the busiest processes and needs the PIN to read', async () => {
+  writeProc(1000, 1000, 100);
+  const started = (await get(PORT, '/diag/start?jsMs=1234&ua=TestBrowser&w=1920&h=1080')).json;
+  assert.strictEqual(started.diag.running, true);
+  assert.strictEqual(started.diag.samples, 1);
+  await wait(200);
+
+  writeProc(1750, 1250, 600);
+  clock.now += 5000;
+  tick();
+
+  assert.strictEqual((await get(SETUP_PORT, '/diag?pin=1', null).catch(() => ({ code: 'closed' }))).code, 'closed');
+  const { pin } = (await get(PORT, '/setup/start')).json;
+  assert.strictEqual((await get(SETUP_PORT, '/diag?pin=000000', null)).code, 403);
+  const report = (await get(SETUP_PORT, '/diag?pin=' + pin, null)).json;
+  await get(PORT, '/setup/stop');
+
+  assert.strictEqual(report.running, true);
+  assert.strictEqual(report.info.hubJsBenchmarkMs, 1234);
+  assert.strictEqual(report.info.browser, 'TestBrowser');
+  assert.strictEqual(report.info.viewport, '1920x1080');
+  assert.ok(report.network.downloadedBytes > 0, 'measured a download');
+  assert.ok(report.network.dnsMs !== undefined);
+  assert.strictEqual(report.samples.length, 2);
+  const last = report.samples[1];
+  assert.strictEqual(last.cpuBusy, 75);
+  assert.deepStrictEqual(last.memory, { totalMb: 2000, availableMb: 500 });
+  assert.strictEqual(last.load, 3.5);
+  assert.strictEqual(last.visibleProcesses, 2);
+  assert.strictEqual(last.top[0].name, 'Web Process');
+  assert.strictEqual(last.top[0].cpu, 50);
+  assert.strictEqual(last.top[0].rssMb, 200);
+  assert.strictEqual(last.top[0].command, 'wrt-loader --site');
+});
+
+test('the speed test stops by itself after five minutes', async () => {
+  for (let i = 0; i < 70; i++) {
+    clock.now += 5000;
+    tick();
+  }
+  const status = (await get(PORT, '/status')).json;
+  assert.strictEqual(status.diag.running, false);
+  assert.strictEqual(status.diag.samples, status.diag.max);
+});
+
 test('a saved calendar address is never shown back, and its certificate is verified', async () => {
   const start = (await get(PORT, '/setup/start')).json;
   const secret = 'https://127.0.0.1:' + feedPort + '/secret-abc/basic.ics';
@@ -525,10 +585,10 @@ test('a moved occurrence replaces the original', async () => {
 });
 
 tvServer.listen(0, '127.0.0.1', async () => {
-  loadService(PORT, tvServer.address().port);
   const feed = https.createServer(TLS_FILES, (req, res) => res.end('BEGIN:VCALENDAR'));
   await new Promise((resolve) => feed.listen(0, '127.0.0.1', resolve));
   feedPort = feed.address().port;
+  loadService(PORT, tvServer.address().port);
   await wait(100);
   let failed = 0;
   for (const t of tests) {

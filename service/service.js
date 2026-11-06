@@ -11,6 +11,7 @@
   var os = require('os');
   var url = require('url');
   var querystring = require('querystring');
+  var dns = require('dns');
 
   var env = (typeof process !== 'undefined' && process.env) || {};
   // A new port for each change to this interface: TizenBrew keeps old services running
@@ -20,7 +21,7 @@
   var TV_HOST = env.TV_HOST || '127.0.0.1';
   var TV_PORT = +env.TV_PORT || 8002;
   var CONFIG_FILE = env.OMES_A_SHOW_CONFIG || '/home/owner/share/omes-a-show.json';
-  var VERSION = '0.3.0';
+  var VERSION = '0.4.0';
 
   // TizenBrew serves module pages from here. Other pages on the TV, such as a website
   // open in another module, must not be able to open apps or turn the TV off.
@@ -56,6 +57,15 @@
   var ICON_MAX_BYTES = 256 * 1024;
   var ICON_MAX_COUNT = 300;
   var ICON_NAME = /^[a-z0-9-]{1,60}$/;
+
+  // The speed test records what the TV is doing for five minutes, so it can run while the
+  // slowness is happening in another app.
+  var PROC_ROOT = env.OMES_A_SHOW_PROC || '/proc';
+  var SPEED_URL = env.OMES_A_SHOW_SPEED_URL || 'https://speed.cloudflare.com/__down?bytes=5000000';
+  var DIAG_TICK_MS = 5000;
+  var DIAG_MAX_SAMPLES = 60;
+  var DIAG_TOP_PROCESSES = 8;
+  var PAGE_SIZE_KB = 4;
 
   var TIZENBREW_APP = 'xvvl3S1bvH.TizenBrewStandalone';
   var MODULE_DATA = { moduleName: 'bdonoho-coder/omes-a-show', moduleType: 'gh' };
@@ -203,6 +213,158 @@
     socket.on('close', function () { finish('closed', 'error'); });
   }
 
+  /* ---------- Speed test ---------- */
+
+  var diag = { ticker: null, samples: [], lastCpu: null, lastProcs: {}, info: {}, network: {} };
+
+  function readProcFile(name) {
+    return fs.readFileSync(PROC_ROOT + '/' + name, 'utf8');
+  }
+
+  function readCpuTotals() {
+    var fields = readProcFile('stat').split('\n')[0].trim().split(/\s+/).slice(1).map(Number);
+    var total = fields.reduce(function (sum, value) { return sum + value; }, 0);
+    return { total: total, idle: fields[3] + (fields[4] || 0) };
+  }
+
+  function readMemoryMb() {
+    var values = {};
+    readProcFile('meminfo').split('\n').forEach(function (line) {
+      var m = /^(\w+):\s+(\d+)/.exec(line);
+      if (m) values[m[1]] = +m[2];
+    });
+    var available = values.MemAvailable !== undefined ? values.MemAvailable :
+      (values.MemFree || 0) + (values.Cached || 0) + (values.Buffers || 0);
+    return { totalMb: Math.round(values.MemTotal / 1024), availableMb: Math.round(available / 1024) };
+  }
+
+  // Other apps' processes may be hidden from this service. What it can read still helps.
+  function readProcesses() {
+    var found = {};
+    fs.readdirSync(PROC_ROOT).forEach(function (pid) {
+      if (!/^\d+$/.test(pid)) return;
+      try {
+        var stat = readProcFile(pid + '/stat');
+        var close = stat.lastIndexOf(')');
+        var rest = stat.slice(close + 2).split(' ');
+        found[pid] = {
+          name: stat.slice(stat.indexOf('(') + 1, close),
+          ticks: +rest[11] + +rest[12],
+          rssMb: Math.round(+rest[21] * PAGE_SIZE_KB / 1024)
+        };
+      } catch (e) { /* it exited, or it's hidden */ }
+    });
+    return found;
+  }
+
+  function commandOf(pid) {
+    try {
+      return readProcFile(pid + '/cmdline').replace(/\0/g, ' ').trim().slice(0, 100);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function diagSample() {
+    var sample = { atSeconds: Math.round((Date.now() - diag.startedAt) / 1000) };
+    try {
+      var cpu = readCpuTotals();
+      var ticks = diag.lastCpu ? cpu.total - diag.lastCpu.total : 0;
+      if (ticks > 0) sample.cpuBusy = Math.round(100 - (cpu.idle - diag.lastCpu.idle) * 100 / ticks);
+      diag.lastCpu = cpu;
+      sample.memory = readMemoryMb();
+      sample.load = +readProcFile('loadavg').split(' ')[0];
+      var procs = readProcesses();
+      var list = Object.keys(procs).map(function (pid) {
+        var before = diag.lastProcs[pid];
+        var proc = procs[pid];
+        return {
+          pid: pid,
+          name: proc.name,
+          rssMb: proc.rssMb,
+          cpu: before && ticks > 0 ? Math.round((proc.ticks - before.ticks) * 1000 / ticks) / 10 : 0
+        };
+      });
+      diag.lastProcs = procs;
+      sample.visibleProcesses = list.length;
+      list.sort(function (a, b) { return b.cpu - a.cpu || b.rssMb - a.rssMb; });
+      sample.top = list.slice(0, DIAG_TOP_PROCESSES).map(function (proc) {
+        proc.command = commandOf(proc.pid);
+        return proc;
+      });
+    } catch (e) {
+      sample.error = e.message;
+    }
+    diag.samples.push(sample);
+    if (diag.samples.length >= DIAG_MAX_SAMPLES) {
+      clearInterval(diag.ticker);
+      diag.ticker = null;
+    }
+  }
+
+  function measureNetwork() {
+    var lookupStart = Date.now();
+    var parsed = url.parse(SPEED_URL);
+    dns.lookup(parsed.hostname, function (error) {
+      diag.network.dnsMs = error ? 'failed: ' + error.code : Date.now() - lookupStart;
+      var start = Date.now();
+      var bytes = 0;
+      var request = https.get({
+        host: parsed.hostname,
+        port: parsed.port || 443,
+        path: parsed.path,
+        // Public test data, and the certificate list on an old TV may be out of date.
+        rejectUnauthorized: false
+      }, function (res) {
+        diag.network.firstByteMs = Date.now() - start;
+        res.on('data', function (chunk) { bytes += chunk.length; });
+        res.on('end', function () {
+          var seconds = (Date.now() - start) / 1000;
+          diag.network.downloadedBytes = bytes;
+          diag.network.seconds = seconds;
+          diag.network.mbps = seconds > 0 ? Math.round(bytes * 8 / seconds / 100000) / 10 : null;
+        });
+      });
+      request.on('error', function (e) { diag.network.error = e.message; });
+      request.setTimeout(FETCH_TIMEOUT_MS * 2, function () {
+        diag.network.error = 'timed out after ' + bytes + ' bytes';
+        request.abort();
+      });
+    });
+  }
+
+  function startDiag(query) {
+    if (diag.ticker) clearInterval(diag.ticker);
+    diag = {
+      ticker: setInterval(diagSample, DIAG_TICK_MS),
+      startedAt: Date.now(),
+      samples: [],
+      lastCpu: null,
+      lastProcs: {},
+      network: {},
+      info: {
+        hubJsBenchmarkMs: +query.jsMs || null,
+        browser: String(query.ua || '').slice(0, 200),
+        viewport: String(query.w || '') + 'x' + String(query.h || ''),
+        node: process.version,
+        cores: os.cpus().length,
+        uptimeSeconds: Math.round(os.uptime())
+      }
+    };
+    diagSample();
+    measureNetwork();
+  }
+
+  function diagReport() {
+    return {
+      version: VERSION,
+      running: !!diag.ticker,
+      info: diag.info,
+      network: diag.network,
+      samples: diag.samples
+    };
+  }
+
   /* ---------- Sleep timer ---------- */
 
   var sleep = { endsAt: 0, ticker: null };
@@ -232,7 +394,8 @@
       version: VERSION,
       sleepRemainingMs: sleep.endsAt ? Math.max(0, sleep.endsAt - Date.now()) : 0,
       remote: remote.status,
-      settingsVersion: settingsVersion
+      settingsVersion: settingsVersion,
+      diag: { running: !!diag.ticker, samples: diag.samples.length, max: DIAG_MAX_SAMPLES }
     };
   }
 
@@ -705,6 +868,11 @@
       return sendHtml(res, 200, setupPage(''));
     }
     if (req.method === 'POST' && u.pathname === '/icon') return handleIconUpload(req, res, u.query);
+    if (req.method === 'GET' && u.pathname === '/diag') {
+      if (!pinMatches(u.query.pin)) return sendHtml(res, 403, 'Wrong PIN');
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify(diagReport()));
+    }
     if (req.method !== 'POST' || u.pathname !== '/save') return sendHtml(res, 404, 'Not found');
     var body = '';
     var tooBig = false;
@@ -851,6 +1019,9 @@
     } else if (u.pathname === '/setup/stop') {
       stopSetup();
       reply(res, 200, { ok: true });
+    } else if (u.pathname === '/diag/start') {
+      startDiag(u.query);
+      reply(res, 200, statusBody());
     } else if (u.pathname === '/sleep') {
       handleSleep(res, u.query);
     } else if (u.pathname === '/power') {

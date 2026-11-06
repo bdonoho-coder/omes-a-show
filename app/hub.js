@@ -32,7 +32,8 @@
   var CALENDAR_EVERY_MS = 5 * 60000;
   var STATUS_EVERY_MS = 3000;
 
-  var CONTROLS = ['setup', 'sleep', 'off'];
+  var CONTROLS = ['setup', 'sleep', 'diag', 'off'];
+  var DIAG_SECONDS_PER_SAMPLE = 5;
 
   // Tiles use a matching icon from the pack on the TV. These names differ from the pack's.
   var PACK_ALIASES = {
@@ -69,6 +70,7 @@
     tile: 0,
     sleepMs: 0,
     sleepSyncedAt: 0,
+    diag: null,
     serviceUp: false,
     settingsVersion: null,
     appsError: false,
@@ -147,6 +149,10 @@
   }
 
   function syncSleep(body) {
+    if (body.diag) {
+      state.diag = body.diag;
+      renderDiag();
+    }
     state.sleepMs = body.sleepRemainingMs;
     state.sleepSyncedAt = Date.now();
     renderSleep();
@@ -387,6 +393,7 @@
       var name = CONTROLS[state.control];
       if (name === 'setup') openSetup();
       else if (name === 'sleep') cycleSleep();
+      else if (name === 'diag') startDiag();
       else turnOff();
       return;
     }
@@ -521,6 +528,38 @@
     var ms = currentSleepMs();
     els.sleep.textContent = ms > 0 ? 'Sleep: ' + formatMinutes(Math.ceil(ms / 60000)) : 'Sleep: Off';
     renderControlFocus();
+  }
+
+  /* ---------- Speed test ---------- */
+
+  // A fixed amount of work, so this TV's browser can be compared with a computer's.
+  function benchmark() {
+    var start = Date.now();
+    var total = 0;
+    for (var i = 0; i < 20000000; i++) total = (total + i * 3) % 1000003;
+    return { ms: Date.now() - start, total: total };
+  }
+
+  function startDiag() {
+    if (!state.serviceUp) return toast('Still starting up. Try again in a moment.');
+    var result = benchmark();
+    callService('/diag/start?jsMs=' + result.ms + '&ua=' + encodeURIComponent(navigator.userAgent) +
+      '&w=' + window.innerWidth + '&h=' + window.innerHeight).then(function (body) {
+      syncSleep(body);
+      toast('Recording for 5 minutes. Open the slow website now and use it normally.');
+    }, function () {
+      toast('The speed test isn\u2019t available. Restart the TV and try again.');
+    });
+  }
+
+  function renderDiag() {
+    var diag = state.diag;
+    if (diag && diag.running) {
+      var left = Math.ceil((diag.max - diag.samples) * DIAG_SECONDS_PER_SAMPLE / 60);
+      els.diag.textContent = 'Testing: ' + left + ' min';
+    } else {
+      els.diag.textContent = diag && diag.samples ? 'Test done' : 'Speed test';
+    }
   }
 
   /* ---------- Weather ---------- */
@@ -697,6 +736,7 @@
     els.date = $('date');
     els.setup = $('setup-btn');
     els.sleep = $('sleep-btn');
+    els.diag = $('diag-btn');
     els.off = $('off-btn');
     els.grid = $('grid');
     els.empty = $('empty');
@@ -712,6 +752,7 @@
 
     renderClock();
     renderSleep();
+    renderDiag();
     renderEmpty();
     buildTiles();
     setInterval(function () {
