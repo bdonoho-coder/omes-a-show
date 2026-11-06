@@ -51,6 +51,12 @@
   var SETUP_MAX_BODY = 16 * 1024;
   var MAX_SITES = 30;
 
+  // Icon packs often can't be redistributed, so they live on the TV, not in this repository.
+  var ICON_DIR = env.OMES_A_SHOW_ICONS || '/home/owner/share/omes-a-show-icons';
+  var ICON_MAX_BYTES = 256 * 1024;
+  var ICON_MAX_COUNT = 300;
+  var ICON_NAME = /^[a-z0-9-]{1,60}$/;
+
   var TIZENBREW_APP = 'xvvl3S1bvH.TizenBrewStandalone';
   var MODULE_DATA = { moduleName: 'bdonoho-coder/omes-a-show', moduleType: 'gh' };
 
@@ -636,6 +642,47 @@
     return '';
   }
 
+  function packIconNames() {
+    try {
+      return fs.readdirSync(ICON_DIR).filter(function (file) {
+        return /\.png$/.test(file);
+      }).map(function (file) {
+        return file.replace(/\.png$/, '');
+      });
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function savePackIcon(name, data) {
+    if (!ICON_NAME.test(name || '')) return 'bad name';
+    if (data.slice(0, 8).toString('hex') !== '89504e470d0a1a0a') return 'not a PNG';
+    if (packIconNames().length >= ICON_MAX_COUNT) return 'too many icons';
+    try {
+      if (!fs.existsSync(ICON_DIR)) fs.mkdirSync(ICON_DIR);
+      fs.writeFileSync(ICON_DIR + '/' + name + '.png', data);
+    } catch (e) {
+      return 'could not save';
+    }
+    settingsVersion++;
+    return '';
+  }
+
+  function handleIconUpload(req, res, query) {
+    var chunks = [];
+    var size = 0;
+    req.on('data', function (chunk) {
+      size += chunk.length;
+      if (size <= ICON_MAX_BYTES) chunks.push(chunk);
+    });
+    req.on('end', function () {
+      if (!pinMatches(query.pin)) return sendHtml(res, 403, 'Wrong PIN');
+      if (size > ICON_MAX_BYTES) return sendHtml(res, 413, 'too large');
+      var problem = savePackIcon(query.name, Buffer.concat(chunks));
+      sendHtml(res, problem ? 400 : 200, problem || 'saved');
+    });
+  }
+
   function sendHtml(res, code, html) {
     res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(html);
@@ -654,6 +701,7 @@
       if (!pinMatches(u.query.pin)) return sendHtml(res, 403, 'Wrong PIN. Scan the code on the TV again.');
       return sendHtml(res, 200, setupPage(''));
     }
+    if (req.method === 'POST' && u.pathname === '/icon') return handleIconUpload(req, res, u.query);
     if (req.method !== 'POST' || u.pathname !== '/save') return sendHtml(res, 404, 'Not found');
     var body = '';
     var tooBig = false;
@@ -720,6 +768,15 @@
     });
   }
 
+  function servePackIcon(res, name) {
+    if (!ICON_NAME.test(name || '')) return reply(res, 404, { error: 'no icon' });
+    fs.readFile(ICON_DIR + '/' + name + '.png', function (err, data) {
+      if (err) return reply(res, 404, { error: 'no icon' });
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'max-age=86400' });
+      res.end(data);
+    });
+  }
+
   function handleSleep(res, query) {
     var minutes = +query.minutes;
     if (SLEEP_STEPS.indexOf(minutes) === -1) return reply(res, 400, { error: 'unknown step' });
@@ -764,6 +821,7 @@
   var server = http.createServer(function (req, res) {
     var u = url.parse(req.url, true);
     if (u.pathname === '/icon') return serveIcon(res, u.query.id);
+    if (u.pathname === '/pack') return servePackIcon(res, u.query.name);
     if (req.headers.origin !== PAGE_ORIGIN) return reply(res, 403, { error: 'forbidden' });
 
     if (u.pathname === '/status') {
@@ -775,6 +833,8 @@
       });
     } else if (u.pathname === '/launch') {
       handleLaunch(res, u.query.id);
+    } else if (u.pathname === '/pack-icons') {
+      reply(res, 200, packIconNames());
     } else if (u.pathname === '/sites') {
       reply(res, 200, config.sites.map(function (site) { return { name: site.name }; }));
     } else if (u.pathname === '/open-site') {

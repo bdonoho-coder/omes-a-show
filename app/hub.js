@@ -24,6 +24,14 @@
 
   var CONTROLS = ['setup', 'sleep', 'off'];
 
+  // Tiles use a matching icon from the pack on the TV. These names differ from the pack's.
+  var PACK_ALIASES = {
+    'tizentube': 'youtube',
+    'prime-video': 'amazon-prime',
+    'amazon-prime-video': 'amazon-prime',
+    'internet': 'google-chrome'
+  };
+
   var MOCK = /[?&]mock=1/.test(location.search);
   var MOCK_APPS = [
     { id: 'mock.netflix', name: 'Netflix' },
@@ -35,12 +43,16 @@
   ];
   var MOCK_MODULES = [{ fullName: 'gh/foxreis/tizentube', appName: 'TizenTube', keys: [] }];
   var MOCK_SITES = [{ name: 'Movie Night' }];
+  // Preview with app/mock-icons/, which stays out of the repository. Add pack=1 to the address.
+  var MOCK_PACK = /[?&]pack=1/.test(location.search) ?
+    ['netflix', 'youtube', 'amazon-prime', 'google-chrome', 'google-calendar'] : [];
 
   var els = {};
   var state = {
     apps: [],
     modules: [],
     sites: [],
+    packIcons: {},
     tiles: [],
     zone: 'tiles',       // 'controls' or 'tiles'
     control: 1,
@@ -76,6 +88,7 @@
     if (sleep) return { sleepRemainingMs: +sleep[1] * 60000, remote: 'ready' };
     if (path === '/apps') return MOCK_APPS;
     if (path === '/sites') return MOCK_SITES;
+    if (path === '/pack-icons') return MOCK_PACK;
     if (path === '/status') return { sleepRemainingMs: currentSleepMs(), remote: 'ready', settingsVersion: 0 };
     if (path === '/setup/start') {
       return { url: 'http://192.168.1.20:8095/?pin=123456', pin: '123456', expiresInMs: 600000 };
@@ -102,6 +115,7 @@
       syncSleep(body);
       loadApps();
       loadSites();
+      loadPackIcons();
       loadCalendar();
       setInterval(pollStatus, STATUS_EVERY_MS);
     }, function () {
@@ -116,6 +130,7 @@
       if (body.settingsVersion !== state.settingsVersion) {
         state.settingsVersion = body.settingsVersion;
         loadSites();
+        loadPackIcons();
         loadCalendar();
       }
     }, function () { /* tries again on the next poll */ });
@@ -145,6 +160,33 @@
       state.sites = list;
       buildTiles();
     }, function () { /* website tiles appear on the next change */ });
+  }
+
+  function packUrl(name) {
+    return MOCK ? 'mock-icons/' + name + '.png' : SERVICE + '/pack?name=' + name;
+  }
+
+  function loadPackIcons() {
+    callService('/pack-icons').then(function (names) {
+      var icons = {};
+      names.forEach(function (name) { icons[name] = true; });
+      state.packIcons = icons;
+      if (icons['omes-logo']) {
+        $('title-logo').src = packUrl('omes-logo');
+        $('taskbar-logo').src = packUrl('omes-logo');
+      }
+      if (icons['google-calendar']) {
+        $('calendar-icon').src = packUrl('google-calendar');
+        $('calendar-icon').style.display = 'block';
+      }
+      buildTiles();
+    }, function () { /* tiles keep their own art */ });
+  }
+
+  function packIconFor(tile) {
+    var slug = shortName(tile.name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    var name = PACK_ALIASES[slug] || slug;
+    return state.packIcons[name] ? name : '';
   }
 
   /* ---------- TizenBrew modules ---------- */
@@ -241,7 +283,18 @@
       letter.textContent = tile.addSite ? '+' : tile.name.charAt(0).toUpperCase();
       art.appendChild(letter);
     }
-    if (tile.app && tile.app.icon) {
+    var packIcon = tile.addSite ? '' : packIconFor(tile);
+    if (packIcon) {
+      art.className = 'art pack';
+      var pack = document.createElement('img');
+      pack.onerror = function () {
+        art.className = 'art';
+        art.removeChild(pack);
+        addLetter();
+      };
+      pack.src = packUrl(packIcon);
+      art.appendChild(pack);
+    } else if (tile.app && tile.app.icon) {
       var img = document.createElement('img');
       img.onerror = function () {
         art.removeChild(img);

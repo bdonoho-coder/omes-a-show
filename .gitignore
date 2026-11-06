@@ -1,3 +1,4 @@
 node_modules/
 *.tgz
 preview*.png
+app/mock-icons/

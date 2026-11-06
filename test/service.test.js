@@ -18,6 +18,7 @@ const PORT = 18094;
 const SETUP_PORT = 18095;
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'omes-a-show-'));
 const CONFIG = path.join(dir, 'config.json');
+const ICON_DIR = path.join(dir, 'icons');
 const ICON = path.join(dir, 'icon.png');
 fs.writeFileSync(ICON, 'png-bytes');
 
@@ -145,7 +146,8 @@ function loadService(port, tvPort) {
       OMES_A_SHOW_PORT: String(port),
       OMES_A_SHOW_SETUP_PORT: String(SETUP_PORT),
       TV_PORT: String(tvPort),
-      OMES_A_SHOW_CONFIG: CONFIG
+      OMES_A_SHOW_CONFIG: CONFIG,
+      OMES_A_SHOW_ICONS: ICON_DIR
     }
   };
   sandbox.setInterval = (fn) => { clock.tickers.add(fn); return fn; };
@@ -165,6 +167,17 @@ function get(port, urlPath, origin) {
         resolve({ code: res.statusCode, json, body, headers: res.headers });
       });
     }).on('error', reject);
+  });
+}
+
+function upload(urlPath, data) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: SETUP_PORT, path: urlPath, method: 'POST', agent: false }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.end(data);
   });
 }
 
@@ -373,6 +386,26 @@ test('setup closes itself after too many wrong PINs', async () => {
   for (let i = 0; i < 5; i++) await get(SETUP_PORT, '/?pin=000000', null);
   await wait(50);
   assert.ok(await setupIsClosed());
+});
+
+test('icon uploads need the PIN and a real PNG', async () => {
+  const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('pixels')]);
+  assert.deepStrictEqual((await get(PORT, '/pack-icons')).json, []);
+  const { pin } = (await get(PORT, '/setup/start')).json;
+  assert.strictEqual(await upload('/icon?pin=000000&name=netflix', png), 403);
+  assert.strictEqual(await upload('/icon?pin=' + pin + '&name=netflix', Buffer.from('not an image')), 400);
+  assert.strictEqual(await upload('/icon?pin=' + pin + '&name=..%2F..%2Fevil', png), 400);
+  assert.strictEqual(await upload('/icon?pin=' + pin + '&name=big', Buffer.alloc(300 * 1024)), 413);
+  assert.deepStrictEqual((await get(PORT, '/pack-icons')).json, []);
+
+  const before = (await get(PORT, '/status')).json.settingsVersion;
+  assert.strictEqual(await upload('/icon?pin=' + pin + '&name=netflix', png), 200);
+  assert.deepStrictEqual((await get(PORT, '/pack-icons')).json, ['netflix']);
+  assert.strictEqual((await get(PORT, '/status')).json.settingsVersion, before + 1);
+  assert.strictEqual((await get(PORT, '/pack?name=netflix', null)).code, 200);
+  assert.strictEqual((await get(PORT, '/pack?name=..%2Fconfig', null)).code, 404);
+  assert.strictEqual((await get(PORT, '/pack?name=missing', null)).code, 404);
+  await get(PORT, '/setup/stop');
 });
 
 test('a saved calendar address is never shown back, and its certificate is verified', async () => {
