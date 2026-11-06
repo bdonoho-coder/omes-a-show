@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Website helper test</title></head>
+<body>
+<!-- Open in a browser, or run: chrome --headless --dump-dom test/adblock.html. Results land in #results. -->
+<a id="first" href="#one" style="position:absolute;top:10px;left:10px;width:100px;height:30px">One</a>
+<a id="right" href="#two" style="position:absolute;top:10px;left:300px;width:100px;height:30px">Two</a>
+<a id="below" href="#three" style="position:absolute;top:200px;left:10px;width:100px;height:30px">Three</a>
+<a id="popup" href="https://example.com/" target="_blank" style="position:absolute;top:300px;left:600px;width:100px;height:30px">Pop</a>
+<ins id="banner" class="adsbygoogle" style="display:block;width:300px;height:100px"></ins>
+<div id="catcher" style="position:fixed;top:0;left:0;width:100%;height:100%;z-index:99999"></div>
+<div id="modal" style="position:fixed;top:0;left:0;width:100%;height:100%;z-index:99999;visibility:hidden">
+  This is a real dialog with far more than forty characters of text in it, so it has to stay.
+</div>
+<div id="player" style="position:relative;width:400px;height:200px">
+  <video id="video"></video>
+  <div id="control" style="position:absolute;top:0;left:0;width:100%;height:100%;z-index:99999"></div>
+</div>
+<iframe id="pre-ad" src="https://ad.doubleclick.net/x" style="display:none"></iframe>
+<pre id="results">running</pre>
+<script>
+  window.fetchedReal = 0;
+  window.fetch = function () { window.fetchedReal++; return Promise.resolve('real'); };
+  window.realOpen = window.open;
+</script>
+<script src="../app/adblock.js"></script>
+<script src="../app/adblock.js"></script>
+<script>
+  var out = [];
+  function check(name, ok) { out.push((ok ? 'ok - ' : 'FAILED - ') + name); }
+  function press(code) {
+    var ev = document.createEvent('Event');
+    ev.initEvent('keydown', true, true);
+    ev.keyCode = code;
+    document.dispatchEvent(ev);
+  }
+
+  check('window.open no longer opens anything', window.open !== window.realOpen && window.open('https://x.example').closed === true);
+
+  var added = document.createElement('iframe');
+  added.src = 'https://www.googlesyndication.com/ad';
+  document.body.appendChild(added);
+  check('ad iframes never reach the page', !added.parentNode);
+
+  var sub = document.createElement('script');
+  sub.src = 'https://cdn.popads.net/pop.js';
+  document.body.appendChild(sub);
+  check('ad scripts on subdomains never reach the page', !sub.parentNode);
+
+  var lookalike = document.createElement('iframe');
+  lookalike.src = 'about:blank';
+  lookalike.setAttribute('data-kept', '1');
+  lookalike.style.display = 'none';
+  document.body.appendChild(lookalike);
+  check('normal iframes stay', !!lookalike.parentNode);
+
+  var notAd = document.createElement('div');
+  notAd.textContent = 'x';
+  document.body.appendChild(notAd);
+  check('normal elements stay', !!notAd.parentNode);
+
+  window.fetch('https://exoclick.com/track').then(function () { check('ad fetch rejected', false); }, function () { check('ad fetch rejected', true); });
+  window.fetch('https://example.com/data');
+  check('normal fetch goes through', window.fetchedReal === 1);
+
+  var lastClick = null;
+  window.addEventListener('click', function (ev) { lastClick = ev; }, true);
+
+  setTimeout(function () {
+    check('pre-existing ad iframe removed', !document.getElementById('pre-ad'));
+    check('invisible click catcher removed', !document.getElementById('catcher'));
+    check('dialog with real text stays', !!document.getElementById('modal'));
+    check('overlay beside a video stays', !!document.getElementById('control'));
+    check('ad banner hidden', getComputedStyle(document.getElementById('banner')).display === 'none');
+
+    function focused() {
+      var el = document.querySelector('.omes-focus');
+      return el ? el.getBoundingClientRect() : null;
+    }
+    press(40);
+    var start = focused();
+    check('down focuses something', !!start);
+    press(37);
+    var moved = focused();
+    check('left moves focus to the left', !!moved && moved.left < start.left);
+    press(39);
+    var back = focused();
+    check('right moves focus back to the right', !!back && back.left > moved.left);
+    check('only one item is focused', document.querySelectorAll('.omes-focus').length === 1);
+
+    document.getElementById('popup').click();
+    check('new-window links are stopped', !!lastClick && lastClick.defaultPrevented);
+    document.getElementById('first').click();
+    check('normal links still work', !!lastClick && !lastClick.defaultPrevented);
+
+    document.getElementById('results').textContent = out.join('\n') + '\ndone';
+  }, 400);
+</script>
+</body>
+</html>

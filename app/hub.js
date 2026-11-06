@@ -3,6 +3,16 @@
   var SERVICE = 'http://127.0.0.1:8094';
   var TIZENBREW_WS = 'ws://127.0.0.1:8081';
   var SELF_MODULE = /(^|\/)omes-a-show(@|$)/;
+  // Website tiles run as a site mod of this module, so TizenBrew puts this script in each page.
+  var SITE_MODULE = {
+    fullName: 'gh/bdonoho-coder/omes-a-show',
+    name: 'bdonoho-coder/omes-a-show',
+    moduleType: 'gh',
+    packageType: 'mods',
+    mainFile: 'app/adblock.js',
+    keys: [],
+    evaluateScriptOnDocumentStart: false
+  };
   var WEATHER_URL = 'https://api.open-meteo.com/v1/forecast?latitude=30.2672&longitude=-97.7431' +
     '&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min' +
     '&forecast_days=1&temperature_unit=fahrenheit&timezone=America%2FChicago';
@@ -253,7 +263,7 @@
       return { name: mdl.appName, module: mdl };
     });
     var sites = state.sites.map(function (site, i) {
-      return { name: site.name, siteIndex: i };
+      return { name: site.name, site: site, siteIndex: i };
     });
     var apps = state.apps.map(function (app) {
       return { name: app.name, app: app };
@@ -406,6 +416,14 @@
 
   function openSite(tile) {
     if (MOCK) return toast('Would open ' + tile.name);
+    var helperReady = tile.site.url && !tile.site.useBrowser && tizenbrew && tizenbrew.ws.readyState === 1;
+    if (helperReady) {
+      var mdl = {};
+      Object.keys(SITE_MODULE).forEach(function (key) { mdl[key] = SITE_MODULE[key]; });
+      mdl.appName = tile.name;
+      mdl.appPath = tile.site.url;
+      return launchModule(mdl);
+    }
     callService('/open-site?i=' + tile.siteIndex).catch(function (err) {
       toast('Couldn’t open ' + tile.name + ': ' + err.message);
     });

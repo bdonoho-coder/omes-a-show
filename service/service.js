@@ -20,7 +20,7 @@
   var TV_HOST = env.TV_HOST || '127.0.0.1';
   var TV_PORT = +env.TV_PORT || 8002;
   var CONFIG_FILE = env.OMES_A_SHOW_CONFIG || '/home/owner/share/omes-a-show.json';
-  var VERSION = '0.2.0';
+  var VERSION = '0.3.0';
 
   // TizenBrew serves module pages from here. Other pages on the TV, such as a website
   // open in another module, must not be able to open apps or turn the TV off.
@@ -559,7 +559,8 @@
   function setupPage(message) {
     var pin = escapeHtml(setup.pin);
     var sites = config.sites.map(function (site, i) {
-      return '<li>' + escapeHtml(site.name) + ' <small>' + escapeHtml(site.url) + '</small>' +
+      return '<li>' + escapeHtml(site.name) + ' <small>' + escapeHtml(site.url) +
+        (site.useBrowser ? ' (TV browser)' : '') + '</small>' +
         '<form method="post" action="/save"><input type="hidden" name="pin" value="' + pin + '">' +
         '<input type="hidden" name="removeSite" value="' + i + '"><button>Remove</button></form></li>';
     }).join('');
@@ -577,6 +578,8 @@
       '<input type="hidden" name="pin" value="' + pin + '">' +
       '<label for="n">Name</label><input type="text" id="n" name="siteName" maxlength="40">' +
       '<label for="u">Link</label><input type="url" id="u" name="siteUrl" placeholder="https://">' +
+      '<label><input type="checkbox" name="useBrowser" value="1"> Open in the TV browser instead (no ad filter). ' +
+      'Try this if a site won\'t load.</label>' +
       '<button>Add</button></form>' + (sites ? '<ul>' + sites + '</ul>' : '') + '</section>' +
       '<section><h1>Google Calendar</h1><p>' + (config.calendarUrl ? 'A calendar is connected.' : 'No calendar yet.') +
       '</p><p>In Google Calendar on a computer: Settings, your calendar, then copy ' +
@@ -616,7 +619,7 @@
       var name = String(form.siteName || '').trim().slice(0, 40);
       if (!/^https?:\/\/[^\s]+$/i.test(address)) return 'That link needs to start with http:// or https://.';
       if (config.sites.length >= MAX_SITES) return 'That is the most websites it can hold. Remove one first.';
-      config.sites.push({ name: name || url.parse(address).hostname, url: address });
+      config.sites.push({ name: name || url.parse(address).hostname, url: address, useBrowser: form.useBrowser === '1' });
       settingsChanged();
       return 'Website added.';
     }
@@ -836,7 +839,7 @@
     } else if (u.pathname === '/pack-icons') {
       reply(res, 200, packIconNames());
     } else if (u.pathname === '/sites') {
-      reply(res, 200, config.sites.map(function (site) { return { name: site.name }; }));
+      reply(res, 200, config.sites);
     } else if (u.pathname === '/open-site') {
       handleOpenSite(res, u.query.i);
     } else if (u.pathname === '/calendar') {

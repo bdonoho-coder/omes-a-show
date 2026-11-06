@@ -16,6 +16,12 @@ Choose **Setup** on the TV and scan the code to add websites or connect a calend
 
 Settings, including your calendar's secret address, stay on the TV. They are never part of this repository.
 
+## Website tiles
+
+Websites open inside TizenBrew with `app/adblock.js` running in every frame, the same way TizenTube runs on YouTube. It blocks common ad networks and pop-ups, removes invisible click-catching overlays, and adds remote control navigation: arrows move, OK clicks or plays, left and right seek a focused video, and Back returns to the hub. It can't remove ads built into a site's video stream.
+
+A site that won't load in the TV's older engine can be set to open in the TV browser instead, without the filter.
+
 ## Layout
 
 - `app/`: the page on the TV. Plain ES5, because older TVs have an old browser.

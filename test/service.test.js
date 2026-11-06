@@ -363,12 +363,16 @@ test('setup needs the PIN, and saves websites that show up as tiles', async () =
   assert.ok(saved.body.includes('Website added.'));
   assert.ok(saved.body.includes('Movie &lt;b&gt;Night&lt;/b&gt;'));
   assert.ok(!saved.body.includes('<b>Night'));
-  assert.deepStrictEqual((await get(PORT, '/sites')).json, [{ name: 'Movie <b>Night</b>' }]);
+  assert.deepStrictEqual((await get(PORT, '/sites')).json, [{ name: 'Movie <b>Night</b>', url: 'https://movies.example/watch', useBrowser: false }]);
   assert.strictEqual((await get(PORT, '/status')).json.settingsVersion, before + 1);
 
   assert.strictEqual((await get(PORT, '/open-site?i=0')).code, 200);
   assert.deepStrictEqual(browsed[0], { uri: 'https://movies.example/watch', appId: 'org.tizen.browser' });
   assert.strictEqual((await get(PORT, '/open-site?i=9')).code, 404);
+
+  await post(SETUP_PORT, '/save', { pin: start.pin, siteName: 'Plain', siteUrl: 'https://plain.example/', useBrowser: '1' });
+  assert.strictEqual((await get(PORT, '/sites')).json[1].useBrowser, true);
+  await post(SETUP_PORT, '/save', { pin: start.pin, removeSite: '1' });
 
   const bad = await post(SETUP_PORT, '/save', { pin: start.pin, siteUrl: 'javascript:alert(1)' });
   assert.ok(bad.body.includes('needs to start with'));
