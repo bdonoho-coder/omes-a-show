@@ -1,0 +1,164 @@
+/* Older TVs have an old browser: flexbox with margins, no gap, no backdrop filters. */
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #101312;
+}
+
+#stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1920px;
+  height: 1080px;
+  overflow: hidden;
+  transform-origin: 0 0;
+  color: #f2efe8;
+  font-family: "SamsungOne", "Samsung Sans", Roboto, Arial, sans-serif;
+}
+
+header {
+  position: absolute;
+  top: 64px;
+  left: 96px;
+  right: 96px;
+  height: 150px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+#clock {
+  font-size: 104px;
+  font-weight: 300;
+  line-height: 1;
+}
+
+#date {
+  margin-top: 12px;
+  font-size: 34px;
+  color: #a6a79f;
+}
+
+#controls {
+  display: flex;
+}
+
+.control {
+  min-width: 250px;
+  margin-left: 24px;
+  padding: 28px 36px;
+  border: 4px solid transparent;
+  border-radius: 14px;
+  background: #1e2321;
+  color: #d9d8d0;
+  font-size: 34px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.control.active {
+  color: #f2c572;
+}
+
+.control.focus {
+  border-color: #f2efe8;
+  background: #f2efe8;
+  color: #101312;
+}
+
+#viewport {
+  position: absolute;
+  top: 270px;
+  left: 64px;
+  right: 64px;
+  bottom: 0;
+  overflow: hidden;
+}
+
+#grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  padding: 16px 32px;
+  transition: transform 180ms ease-out;
+}
+
+.tile {
+  position: relative;
+  width: 256px;
+  height: 216px;
+  margin: 0 16px 32px;
+  border-radius: 14px;
+  background: #1e2321;
+  overflow: hidden;
+  transition: transform 120ms ease-out;
+}
+
+.tile.focus {
+  transform: scale(1.08);
+  box-shadow: 0 0 0 5px #f2efe8;
+}
+
+.tile .art {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 152px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tile img {
+  max-width: 200px;
+  max-height: 124px;
+}
+
+.tile .letter {
+  font-size: 76px;
+  font-weight: 300;
+  color: #f2efe8;
+}
+
+.tile .name {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 16px;
+  font-size: 28px;
+  color: #d9d8d0;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#empty {
+  display: none;
+  padding: 80px 48px;
+  font-size: 36px;
+  color: #a6a79f;
+}
+
+#toast {
+  position: absolute;
+  left: 50%;
+  bottom: 56px;
+  max-width: 1400px;
+  padding: 24px 40px;
+  border-radius: 14px;
+  background: #f2efe8;
+  color: #101312;
+  font-size: 32px;
+  opacity: 0;
+  transform: translateX(-50%);
+  transition: opacity 180ms ease-out;
+  pointer-events: none;
+}
+
+#toast.show {
+  opacity: 1;
+}

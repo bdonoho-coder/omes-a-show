@@ -1,0 +1,19 @@
+{
+  "name": "omes-a-show",
+  "version": "0.1.0",
+  "description": "A simple home hub for older Samsung TVs: app tiles, a clock and a sleep timer. Runs as a TizenBrew app module.",
+  "packageType": "app",
+  "appName": "Omes a Show",
+  "appPath": "app/index.html",
+  "serviceFile": "service/service.js",
+  "keys": [],
+  "keywords": ["tizenbrew", "tizen", "samsung", "launcher"],
+  "files": ["app", "service"],
+  "license": "MIT",
+  "scripts": {
+    "test": "node test/service.test.js && node test/es5.test.js"
+  },
+  "devDependencies": {
+    "acorn": "^8.12.0"
+  }
+}
