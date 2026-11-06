@@ -7,22 +7,57 @@
 </head>
 <body>
 <div id="stage">
-  <header>
-    <div id="time-block">
-      <div id="clock"></div>
-      <div id="date"></div>
+  <section class="window" id="main-window">
+    <div class="title-bar"><img src="logo.png" alt=""><span>Omes a Show</span></div>
+    <div class="window-body" id="viewport">
+      <div id="grid"></div>
+      <div id="empty"></div>
     </div>
-    <div id="controls">
-      <div class="control" id="sleep-btn"></div>
-      <div class="control" id="off-btn">Turn off TV</div>
+  </section>
+
+  <section class="window" id="weather-window">
+    <div class="title-bar"><span>Weather - Austin</span></div>
+    <div class="window-body">
+      <div id="weather-temp"></div>
+      <div id="weather-text"></div>
     </div>
-  </header>
-  <main id="viewport">
-    <div id="grid"></div>
-    <div id="empty"></div>
-  </main>
+  </section>
+
+  <section class="window" id="calendar-window">
+    <div class="title-bar"><span>Calendar</span></div>
+    <div class="window-body" id="calendar-list"></div>
+  </section>
+
+  <footer id="taskbar">
+    <img id="taskbar-logo" src="logo.png" alt="">
+    <div class="control" id="setup-btn">Setup</div>
+    <div class="control" id="sleep-btn"></div>
+    <div class="control" id="off-btn">Turn off TV</div>
+    <div id="tray">
+      <span id="date"></span>
+      <span id="clock"></span>
+    </div>
+  </footer>
+
+  <div id="modal-shade">
+    <section class="window" id="setup-window">
+      <div class="title-bar"><span>Setup from your phone</span></div>
+      <div class="window-body">
+        <canvas id="setup-qr" width="330" height="330"></canvas>
+        <div id="setup-text">
+          <p>1. Connect your phone to the same Wi-Fi as this TV.</p>
+          <p>2. Scan this code with your phone's camera.</p>
+          <p>3. Add websites or your calendar.</p>
+          <p id="setup-address"></p>
+          <p id="setup-hint">Press OK or Back when you're done.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
   <div id="toast"></div>
 </div>
+<script src="vendor/qrcode.js"></script>
 <script src="hub.js"></script>
 </body>
 </html>

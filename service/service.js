@@ -1,20 +1,26 @@
 // Omes a Show service. TizenBrew runs this on the TV's Node, which can be as old as v4,
 // so it stays ES5 and uses core modules only. It gives the page, which can't rely on the
-// Tizen API, a local HTTP interface, and it owns the sleep timer: the page goes away as
-// soon as another app opens, and the service doesn't.
+// Tizen API, a local HTTP interface. It owns everything that must outlive the page, like
+// the sleep timer, and everything the page can't reach, like the calendar feed.
 (function () {
   var http = require('http');
+  var https = require('https');
   var tls = require('tls');
   var crypto = require('crypto');
   var fs = require('fs');
+  var os = require('os');
   var url = require('url');
+  var querystring = require('querystring');
 
   var env = (typeof process !== 'undefined' && process.env) || {};
-  var PORT = +env.OMES_A_SHOW_PORT || 8092;
+  // A new port for each change to this interface: TizenBrew keeps old services running
+  // until the TV restarts, and an old copy would otherwise keep answering the new page.
+  var PORT = +env.OMES_A_SHOW_PORT || 8094;
+  var SETUP_PORT = +env.OMES_A_SHOW_SETUP_PORT || 8095;
   var TV_HOST = env.TV_HOST || '127.0.0.1';
   var TV_PORT = +env.TV_PORT || 8002;
   var CONFIG_FILE = env.OMES_A_SHOW_CONFIG || '/home/owner/share/omes-a-show.json';
-  var VERSION = '0.1.0';
+  var VERSION = '0.2.0';
 
   // TizenBrew serves module pages from here. Other pages on the TV, such as a website
   // open in another module, must not be able to open apps or turn the TV off.
@@ -26,9 +32,31 @@
   // turned off by hand and has just come back on, so the power key would switch it off again.
   var SLEEP_LATE_LIMIT_MS = 60000;
 
+  var WAKE_TICK_MS = 15000;
+  var WAKE_GAP_MS = 60000;
+
   var ANSWER_TIMEOUT_MS = 30000;
   var KEY_SETTLE_MS = 1500;
   var APPS_MAX_AGE_MS = 60000;
+
+  var CALENDAR_MAX_AGE_MS = 15 * 60000;
+  var CALENDAR_MAX_BYTES = 8 * 1024 * 1024;
+  var CALENDAR_PAST_MS = 36 * 3600000;
+  var CALENDAR_FUTURE_MS = 9 * 24 * 3600000;
+  var RECURRENCE_LIMIT = 20000;
+  var FETCH_TIMEOUT_MS = 20000;
+
+  var SETUP_LIFETIME_MS = 10 * 60000;
+  var SETUP_MAX_BAD_PINS = 5;
+  var SETUP_MAX_BODY = 16 * 1024;
+  var MAX_SITES = 30;
+
+  var TIZENBREW_APP = 'xvvl3S1bvH.TizenBrewStandalone';
+  var MODULE_DATA = { moduleName: 'bdonoho-coder/omes-a-show', moduleType: 'gh' };
+
+  var WEATHER_URL = 'https://api.open-meteo.com/v1/forecast?latitude=30.2672&longitude=-97.7431' +
+    '&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min' +
+    '&forecast_days=1&temperature_unit=fahrenheit&timezone=America%2FChicago';
 
   var BUILT_IN_APPS = {
     'com.samsung.tv.cobalt-yt': true,
@@ -44,18 +72,22 @@
     return Buffer.from ? Buffer.from(text, encoding) : new Buffer(text, encoding);
   }
 
-  /* ---------- Saved pairing token ---------- */
+  /* ---------- Settings, kept only on the TV ---------- */
 
-  var config = { token: '' };
+  var config = { token: '', sites: [], calendarUrl: '', openOnWake: true };
+  var settingsVersion = 0;
   try {
-    config.token = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')).token || '';
+    var saved = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    config.token = saved.token || '';
+    config.sites = saved.sites || [];
+    config.calendarUrl = saved.calendarUrl || '';
+    config.openOnWake = saved.openOnWake !== false;
   } catch (e) { /* first run */ }
 
-  function saveToken(token) {
-    config.token = token;
+  function saveConfig() {
     try {
       fs.writeFileSync(CONFIG_FILE, JSON.stringify(config));
-    } catch (e) { /* the TV will ask for permission again next time */ }
+    } catch (e) { /* settings last until the TV restarts */ }
   }
 
   /* ---------- The TV's remote control channel ---------- */
@@ -134,7 +166,8 @@
       try { msg = JSON.parse(text); } catch (e) { return; }
       if (msg.event === 'ms.channel.connect') {
         if (msg.data && msg.data.token && String(msg.data.token) !== config.token) {
-          saveToken(String(msg.data.token));
+          config.token = String(msg.data.token);
+          saveConfig();
         }
         if (!key) return finish(null, 'ready');
         socket.write(wsFrame(JSON.stringify({
@@ -143,7 +176,8 @@
         })));
         setTimeout(function () { finish(null, 'ready'); }, KEY_SETTLE_MS);
       } else if (msg.event === 'ms.channel.unauthorized') {
-        saveToken('');
+        config.token = '';
+        saveConfig();
         finish('denied', 'denied');
       }
     }
@@ -191,11 +225,38 @@
     return {
       version: VERSION,
       sleepRemainingMs: sleep.endsAt ? Math.max(0, sleep.endsAt - Date.now()) : 0,
-      remote: remote.status
+      remote: remote.status,
+      settingsVersion: settingsVersion
     };
   }
 
-  /* ---------- Apps ---------- */
+  /* ---------- Open the hub when the TV wakes ---------- */
+
+  // Timers stop while the TV is off, so a long gap between ticks means it just came back on.
+  // Autorun Last App reopens whatever ran last, which may not be the hub. This only helps
+  // when the service survived standby; after a full restart the TV's own setting takes over.
+  var lastWakeTick = Date.now();
+
+  function openHub() {
+    try {
+      var data = new tizen.ApplicationControlData('module', [JSON.stringify(MODULE_DATA)]);
+      var control = new tizen.ApplicationControl('http://tizen.org/appcontrol/operation/default', null, null, null, [data]);
+      tizen.application.launchAppControl(control, TIZENBREW_APP, null, function () {
+        tizen.application.launch(TIZENBREW_APP);
+      });
+    } catch (e) {
+      tizen.application.launch(TIZENBREW_APP);
+    }
+  }
+
+  setInterval(function () {
+    var now = Date.now();
+    var gap = now - lastWakeTick;
+    lastWakeTick = now;
+    if (gap > WAKE_GAP_MS && config.openOnWake) openHub();
+  }, WAKE_TICK_MS);
+
+  /* ---------- Apps and websites ---------- */
 
   var appsCache = { at: 0, list: null, icons: {} };
 
@@ -224,7 +285,418 @@
     }, function (e) { done(e); });
   }
 
-  /* ---------- HTTP ---------- */
+  function openUrl(address, done) {
+    var control = new tizen.ApplicationControl('http://tizen.org/appcontrol/operation/view', address);
+    tizen.application.launchAppControl(control, 'org.tizen.browser', function () { done(null); }, function () {
+      // Fall back to whichever app handles web links.
+      tizen.application.launchAppControl(control, null, function () { done(null); }, function (e) { done(e); });
+    });
+  }
+
+  /* ---------- Fetching over HTTPS ---------- */
+
+  function fetchText(address, options, done, redirects) {
+    var finished = false;
+    function finish(error, text) {
+      if (finished) return;
+      finished = true;
+      done(error, text);
+    }
+    var parsed = url.parse(address);
+    var request = https.get({
+      host: parsed.hostname,
+      port: parsed.port || 443,
+      path: parsed.path,
+      rejectUnauthorized: options.rejectUnauthorized !== false,
+      headers: { 'User-Agent': 'OmesAShow/' + VERSION }
+    }, function (res) {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && (redirects || 0) < 3) {
+        res.resume();
+        var next = url.resolve(address, res.headers.location);
+        if (!/^https:/.test(next)) return finish(new Error('redirect left HTTPS'));
+        return fetchText(next, options, finish, (redirects || 0) + 1);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return finish(new Error('HTTP ' + res.statusCode));
+      }
+      var chunks = [];
+      var size = 0;
+      res.on('data', function (chunk) {
+        size += chunk.length;
+        if (size > options.maxBytes) {
+          request.abort();
+          return finish(new Error('too large'));
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', function () { finish(null, Buffer.concat(chunks).toString('utf8')); });
+      res.on('error', function (e) { finish(e); });
+    });
+    request.on('error', function (e) { finish(e); });
+    request.setTimeout(FETCH_TIMEOUT_MS, function () {
+      request.abort();
+      finish(new Error('timed out'));
+    });
+  }
+
+  /* ---------- Calendar ---------- */
+
+  // Times are kept as "wall clock" values: a UTC millisecond count holding the local digits.
+  // Only times written in UTC (ending in Z) are absolute. The page converts both, because
+  // the page knows the TV's time zone and this service may not. Events with a named zone
+  // are treated as being in the TV's zone, which holds for a calendar kept in Austin.
+  function parseIcsTime(value, params) {
+    var m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/.exec(value);
+    if (!m) return null;
+    return {
+      at: Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)),
+      allDay: !m[4] || /VALUE=DATE(;|$)/.test(params),
+      utc: !!m[7]
+    };
+  }
+
+  function unescapeIcs(text) {
+    return text.replace(/\\n/gi, ' ').replace(/\\([,;\\])/g, '$1');
+  }
+
+  function parseRule(value) {
+    var rule = { interval: 1 };
+    value.split(';').forEach(function (part) {
+      var pair = part.split('=');
+      if (pair[0] === 'FREQ') rule.freq = pair[1];
+      else if (pair[0] === 'INTERVAL') rule.interval = +pair[1] || 1;
+      else if (pair[0] === 'COUNT') rule.count = +pair[1];
+      else if (pair[0] === 'UNTIL') rule.until = parseIcsTime(pair[1], '');
+      else if (pair[0] === 'BYDAY') rule.byDay = pair[1].split(',');
+    });
+    return rule;
+  }
+
+  function parseIcs(text) {
+    var events = [];
+    var moved = {};
+    var current = null;
+    text.replace(/\r\n/g, '\n').replace(/\n[ \t]/g, '').split('\n').forEach(function (line) {
+      if (line === 'BEGIN:VEVENT') {
+        current = { excluded: {} };
+        return;
+      }
+      if (line === 'END:VEVENT') {
+        if (current && current.start && !current.cancelled) events.push(current);
+        if (current && current.recurrenceId && current.uid) moved[current.uid + '|' + current.recurrenceId.at] = true;
+        current = null;
+        return;
+      }
+      if (!current) return;
+      var colon = line.indexOf(':');
+      if (colon === -1) return;
+      var head = line.slice(0, colon).split(';');
+      var name = head[0];
+      var params = head.slice(1).join(';');
+      var value = line.slice(colon + 1);
+      if (name === 'SUMMARY') current.title = unescapeIcs(value);
+      else if (name === 'UID') current.uid = value;
+      else if (name === 'DTSTART') current.start = parseIcsTime(value, params);
+      else if (name === 'RECURRENCE-ID') current.recurrenceId = parseIcsTime(value, params);
+      else if (name === 'RRULE') current.rule = parseRule(value);
+      else if (name === 'STATUS') current.cancelled = value === 'CANCELLED';
+      else if (name === 'EXDATE') {
+        value.split(',').forEach(function (item) {
+          var time = parseIcsTime(item, params);
+          if (time) current.excluded[time.at] = true;
+        });
+      }
+    });
+    events.forEach(function (event) {
+      event.moved = moved;
+    });
+    return events;
+  }
+
+  var WEEKDAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+  var DAY_MS = 24 * 3600000;
+
+  // Calls visit(at) for each occurrence in order, until visit returns false.
+  function eachOccurrence(event, visit) {
+    var rule = event.rule;
+    var start = event.start.at;
+    var first = new Date(start);
+    var timeOfDay = start % DAY_MS;
+
+    function monthDate(index, day) {
+      return Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + index, day) + timeOfDay;
+    }
+
+    // BYDAY=2TU means the second Tuesday of the month, and -1FR the last Friday.
+    function nthWeekday(index, code) {
+      var m = /^(-?\d+)?([A-Z]{2})$/.exec(code);
+      if (!m) return null;
+      var n = +(m[1] || 1);
+      var weekday = WEEKDAYS.indexOf(m[2]);
+      var at;
+      if (n > 0) {
+        at = monthDate(index, 1);
+        at += ((weekday - new Date(at).getUTCDay() + 7) % 7) * DAY_MS + (n - 1) * 7 * DAY_MS;
+      } else {
+        at = monthDate(index + 1, 0);
+        at -= ((new Date(at).getUTCDay() - weekday + 7) % 7) * DAY_MS + (-n - 1) * 7 * DAY_MS;
+      }
+      return new Date(at).getUTCMonth() === new Date(monthDate(index, 1)).getUTCMonth() ? at : null;
+    }
+
+    function candidate(step) {
+      if (rule.freq === 'DAILY') return [start + step * DAY_MS];
+      if (rule.freq === 'WEEKLY') {
+        var day = new Date(start + step * DAY_MS).getUTCDay();
+        var codes = rule.byDay || [WEEKDAYS[first.getUTCDay()]];
+        var monday = (first.getUTCDay() + 6) % 7;
+        var week = Math.floor((step + monday) / 7);
+        return week % rule.interval === 0 && codes.indexOf(WEEKDAYS[day]) !== -1 ? [start + step * DAY_MS] : [];
+      }
+      if (rule.freq === 'MONTHLY') {
+        var index = step * rule.interval;
+        if (rule.byDay) return rule.byDay.map(function (code) { return nthWeekday(index, code); });
+        var at = monthDate(index, first.getUTCDate());
+        return new Date(at).getUTCDate() === first.getUTCDate() ? [at] : [];
+      }
+      if (rule.freq === 'YEARLY') {
+        var years = monthDate(step * rule.interval * 12, first.getUTCDate());
+        return new Date(years).getUTCDate() === first.getUTCDate() ? [years] : [];
+      }
+      return [];
+    }
+
+    if (!rule || !rule.freq) return visit(start);
+    var seen = 0;
+    var dayInterval = rule.freq === 'DAILY' ? rule.interval : 1;
+    for (var step = 0; step < RECURRENCE_LIMIT; step++) {
+      var list = candidate(step * dayInterval);
+      for (var i = 0; i < list.length; i++) {
+        var occurrence = list[i];
+        if (occurrence === null || occurrence < start) continue;
+        if (rule.until && occurrence > rule.until.at) return;
+        seen++;
+        if (rule.count && seen > rule.count) return;
+        if (visit(occurrence) === false) return;
+      }
+    }
+  }
+
+  function expandCalendar(events, from, to) {
+    var out = [];
+    events.forEach(function (event) {
+      eachOccurrence(event, function (at) {
+        if (at > to) return false;
+        if (at < from || event.excluded[at]) return true;
+        if (!event.recurrenceId && event.moved[event.uid + '|' + at]) return true;
+        out.push({ title: event.title || '(No title)', allDay: event.start.allDay, utc: event.start.utc, at: at });
+        return true;
+      });
+    });
+    out.sort(function (a, b) { return a.at - b.at; });
+    return out;
+  }
+
+  var calendar = { at: 0, events: null, error: '', loading: [] };
+
+  function loadCalendar(done) {
+    if (!config.calendarUrl) return done({ configured: false, events: [] });
+    function answer() {
+      var now = Date.now();
+      done({
+        configured: true,
+        error: calendar.error,
+        events: calendar.events ? expandCalendar(calendar.events, now - CALENDAR_PAST_MS, now + CALENDAR_FUTURE_MS) : []
+      });
+    }
+    if (calendar.at && Date.now() - calendar.at < CALENDAR_MAX_AGE_MS) return answer();
+    calendar.loading.push(answer);
+    if (calendar.loading.length > 1) return;
+    fetchText(config.calendarUrl, { maxBytes: CALENDAR_MAX_BYTES }, function (error, text) {
+      if (error) {
+        calendar.error = error.message;
+      } else {
+        calendar.events = parseIcs(text);
+        calendar.error = '';
+      }
+      calendar.at = Date.now();
+      var waiting = calendar.loading;
+      calendar.loading = [];
+      waiting.forEach(function (callback) { callback(); });
+    });
+  }
+
+  /* ---------- Setup from a phone ---------- */
+
+  // Typing a long link with a TV remote is miserable, so this page opens on the home network
+  // while the setup window is on screen. It needs the PIN shown on the TV, closes after a few
+  // wrong guesses or a few minutes, and never shows the saved calendar address again.
+  var setup = { server: null, pin: '', timer: null, badPins: 0 };
+
+  function escapeHtml(text) {
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function tvAddress() {
+    var interfaces = os.networkInterfaces();
+    var found = '';
+    Object.keys(interfaces).forEach(function (name) {
+      interfaces[name].forEach(function (item) {
+        if (!found && item.family === 'IPv4' && !item.internal) found = item.address;
+      });
+    });
+    return found;
+  }
+
+  function setupPage(message) {
+    var pin = escapeHtml(setup.pin);
+    var sites = config.sites.map(function (site, i) {
+      return '<li>' + escapeHtml(site.name) + ' <small>' + escapeHtml(site.url) + '</small>' +
+        '<form method="post" action="/save"><input type="hidden" name="pin" value="' + pin + '">' +
+        '<input type="hidden" name="removeSite" value="' + i + '"><button>Remove</button></form></li>';
+    }).join('');
+    return '<!doctype html><html><head><meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Omes a Show setup</title>' +
+      '<style>body{font:18px Arial,sans-serif;background:#008080;margin:0;padding:12px}' +
+      'section{background:#c0c0c0;border:2px outset #fff;padding:14px;margin:0 auto 14px;max-width:560px}' +
+      'h1{font-size:20px;background:#000080;color:#fff;margin:-14px -14px 12px;padding:8px}' +
+      'label{display:block;margin:10px 0 4px}input[type=text],input[type=url]{width:100%;box-sizing:border-box;' +
+      'padding:10px;font-size:18px}button{padding:10px 18px;font-size:18px;margin-top:10px}' +
+      'small{color:#333;word-break:break-all}li{margin:8px 0}ul{padding-left:20px}p.msg{font-weight:bold}</style>' +
+      '</head><body>' +
+      (message ? '<section><p class="msg">' + escapeHtml(message) + '</p></section>' : '') +
+      '<section><h1>Add a website</h1><form method="post" action="/save">' +
+      '<input type="hidden" name="pin" value="' + pin + '">' +
+      '<label for="n">Name</label><input type="text" id="n" name="siteName" maxlength="40">' +
+      '<label for="u">Link</label><input type="url" id="u" name="siteUrl" placeholder="https://">' +
+      '<button>Add</button></form>' + (sites ? '<ul>' + sites + '</ul>' : '') + '</section>' +
+      '<section><h1>Google Calendar</h1><p>' + (config.calendarUrl ? 'A calendar is connected.' : 'No calendar yet.') +
+      '</p><p>In Google Calendar on a computer: Settings, your calendar, then copy ' +
+      '<b>Secret address in iCal format</b>. Treat it like a password.</p>' +
+      '<form method="post" action="/save"><input type="hidden" name="pin" value="' + pin + '">' +
+      '<label for="c">Secret address</label><input type="url" id="c" name="calendarUrl" placeholder="https://calendar.google.com/...">' +
+      '<button>Save calendar</button></form>' +
+      (config.calendarUrl ? '<form method="post" action="/save"><input type="hidden" name="pin" value="' + pin + '">' +
+        '<input type="hidden" name="removeCalendar" value="1"><button>Remove calendar</button></form>' : '') +
+      '</section><section><h1>Power on</h1><p>Open the hub when the TV wakes: <b>' + (config.openOnWake ? 'On' : 'Off') + '</b></p>' +
+      '<form method="post" action="/save"><input type="hidden" name="pin" value="' + pin + '">' +
+      '<input type="hidden" name="openOnWake" value="' + (config.openOnWake ? '0' : '1') + '">' +
+      '<button>Turn ' + (config.openOnWake ? 'off' : 'on') + '</button></form></section></body></html>';
+  }
+
+  function settingsChanged() {
+    settingsVersion++;
+    saveConfig();
+  }
+
+  function forgetCalendar() {
+    calendar.events = null;
+    calendar.at = 0;
+    calendar.error = '';
+  }
+
+  function applySetup(form) {
+    if (form.removeSite !== undefined) {
+      var index = +form.removeSite;
+      if (!config.sites[index]) return 'That website is already gone.';
+      config.sites.splice(index, 1);
+      settingsChanged();
+      return 'Website removed.';
+    }
+    if (form.siteUrl !== undefined) {
+      var address = String(form.siteUrl).trim();
+      var name = String(form.siteName || '').trim().slice(0, 40);
+      if (!/^https?:\/\/[^\s]+$/i.test(address)) return 'That link needs to start with http:// or https://.';
+      if (config.sites.length >= MAX_SITES) return 'That is the most websites it can hold. Remove one first.';
+      config.sites.push({ name: name || url.parse(address).hostname, url: address });
+      settingsChanged();
+      return 'Website added.';
+    }
+    if (form.calendarUrl !== undefined) {
+      var feed = String(form.calendarUrl).trim();
+      if (!/^https:\/\/[^\s]+$/i.test(feed)) return 'That address needs to start with https://.';
+      config.calendarUrl = feed;
+      forgetCalendar();
+      settingsChanged();
+      return 'Calendar saved. It will appear on the TV shortly.';
+    }
+    if (form.removeCalendar !== undefined) {
+      config.calendarUrl = '';
+      forgetCalendar();
+      settingsChanged();
+      return 'Calendar removed.';
+    }
+    if (form.openOnWake !== undefined) {
+      config.openOnWake = form.openOnWake === '1';
+      settingsChanged();
+      return 'Saved.';
+    }
+    return '';
+  }
+
+  function sendHtml(res, code, html) {
+    res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(html);
+  }
+
+  function pinMatches(candidate) {
+    if (candidate === setup.pin) return true;
+    setup.badPins++;
+    if (setup.badPins >= SETUP_MAX_BAD_PINS) setTimeout(stopSetup, 0);
+    return false;
+  }
+
+  function handleSetupRequest(req, res) {
+    var u = url.parse(req.url, true);
+    if (req.method === 'GET' && u.pathname === '/') {
+      if (!pinMatches(u.query.pin)) return sendHtml(res, 403, 'Wrong PIN. Scan the code on the TV again.');
+      return sendHtml(res, 200, setupPage(''));
+    }
+    if (req.method !== 'POST' || u.pathname !== '/save') return sendHtml(res, 404, 'Not found');
+    var body = '';
+    var tooBig = false;
+    req.on('data', function (chunk) {
+      body += chunk;
+      if (body.length > SETUP_MAX_BODY) {
+        tooBig = true;
+        body = '';
+      }
+    });
+    req.on('end', function () {
+      if (tooBig) return sendHtml(res, 413, 'Too long');
+      var form = querystring.parse(body);
+      if (!pinMatches(form.pin)) return sendHtml(res, 403, 'Wrong PIN. Scan the code on the TV again.');
+      sendHtml(res, 200, setupPage(applySetup(form)));
+    });
+  }
+
+  function stopSetup() {
+    if (setup.timer) clearTimeout(setup.timer);
+    if (setup.server) setup.server.close();
+    setup = { server: null, pin: '', timer: null, badPins: 0 };
+  }
+
+  function startSetup(res) {
+    stopSetup();
+    var pin = String(100000 + crypto.randomBytes(4).readUInt32BE(0) % 900000);
+    var server = http.createServer(handleSetupRequest);
+    server.on('error', function () {
+      stopSetup();
+      reply(res, 500, { error: 'setup port unavailable' });
+    });
+    server.listen(SETUP_PORT, function () {
+      setup = { server: server, pin: pin, badPins: 0, timer: setTimeout(stopSetup, SETUP_LIFETIME_MS) };
+      reply(res, 200, {
+        url: 'http://' + tvAddress() + ':' + SETUP_PORT + '/?pin=' + pin,
+        pin: pin,
+        expiresInMs: SETUP_LIFETIME_MS
+      });
+    });
+  }
+
+  /* ---------- HTTP for the page ---------- */
 
   function reply(res, code, body) {
     res.writeHead(code, {
@@ -267,6 +739,28 @@
     });
   }
 
+  function handleOpenSite(res, index) {
+    var site = config.sites[+index];
+    if (!site) return reply(res, 404, { error: 'unknown website' });
+    openUrl(site.url, function (error) {
+      if (error) return reply(res, 500, { error: error.message });
+      reply(res, 200, { ok: true });
+    });
+  }
+
+  // Weather is public data, so an old TV's outdated certificate list shouldn't stop it.
+  // Calendar requests carry a secret address and always verify the certificate.
+  function handleWeather(res) {
+    fetchText(WEATHER_URL, { maxBytes: 64 * 1024, rejectUnauthorized: false }, function (error, text) {
+      if (error) return reply(res, 502, { error: error.message });
+      try {
+        reply(res, 200, JSON.parse(text));
+      } catch (e) {
+        reply(res, 502, { error: 'bad weather data' });
+      }
+    });
+  }
+
   var server = http.createServer(function (req, res) {
     var u = url.parse(req.url, true);
     if (u.pathname === '/icon') return serveIcon(res, u.query.id);
@@ -281,6 +775,19 @@
       });
     } else if (u.pathname === '/launch') {
       handleLaunch(res, u.query.id);
+    } else if (u.pathname === '/sites') {
+      reply(res, 200, config.sites.map(function (site) { return { name: site.name }; }));
+    } else if (u.pathname === '/open-site') {
+      handleOpenSite(res, u.query.i);
+    } else if (u.pathname === '/calendar') {
+      loadCalendar(function (body) { reply(res, 200, body); });
+    } else if (u.pathname === '/weather') {
+      handleWeather(res);
+    } else if (u.pathname === '/setup/start') {
+      startSetup(res);
+    } else if (u.pathname === '/setup/stop') {
+      stopSetup();
+      reply(res, 200, { ok: true });
     } else if (u.pathname === '/sleep') {
       handleSleep(res, u.query);
     } else if (u.pathname === '/power') {
